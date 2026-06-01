@@ -12,7 +12,7 @@ subsystems; this directory is self-contained and touches nothing outside
 
 | File | Purpose |
 | --- | --- |
-| `mod.rs` | Public re-exports. The only file the rest of the kernel needs to know about. |
+| `mod.rs` | Public re-exports, the global `VFS` singleton, and the `init()` bring-up entry point. The only file the rest of the kernel needs to know about. |
 | `vfs.rs` | The Virtual Filesystem abstraction: `FileSystem` trait, `Vfs` mount table, `File` handles, error types. |
 | `ramfs.rs` | A complete in-memory `FileSystem` implementation. Mountable at `/` to let the kernel boot before any block driver exists. |
 | `README.md` | This document. |
@@ -174,36 +174,90 @@ sharded by inode, or moved behind an `RwLock`. Not worth doing now.
 
 ---
 
-## How the kernel uses this
+## Kernel integration (Phase 2)
 
-Sketch of expected usage (the kernel-bootstrap agent will own the real
-call site):
+The filesystem now owns its own singleton and bring-up. The integration
+agent (Agent 7) does **not** construct a `Vfs` or mount anything by hand —
+it calls one function.
 
 ```rust
-use fs::{RamFs, Vfs, OpenFlags};
-
-static VFS: Vfs = Vfs::new();
-
-fn early_boot() {
-    let root = RamFs::new();
-    VFS.mount("/", root).unwrap();
-
-    VFS.mkdir("/dev", 0o755).unwrap();
-    VFS.mkdir("/proc", 0o555).unwrap();
-    VFS.mkdir("/sentinel", 0o700).unwrap();
-
-    let init = VFS.open(
-        "/init",
-        OpenFlags { write: true, create: true, ..OpenFlags::default() },
-    ).unwrap();
-    init.write(b"#!/bin/golem-init\n").unwrap();
-}
+// In kernel_main, after the heap is up:
+fs::init();
 ```
 
-Later, when the device-driver agent has a devfs:
+`fs::init()`:
+
+1. Mounts a fresh `RamFs` at `/` — the root filesystem is in place before
+   any userspace process runs.
+2. Creates the baseline directory skeleton on that root: `/dev` (0755),
+   `/proc` (0555), `/sys` (0555), `/tmp` (1777). These are conventional
+   early mount points plus a writable scratch dir, so early userspace and
+   later mounts (e.g. a real `devfs`) have somewhere to land. All four are
+   pure ramfs operations; no other subsystem is touched.
+3. Is **idempotent** — guarded by an atomic, a second call is a no-op.
+
+It returns `()`. On a freshly-constructed `VFS` every step is structurally
+infallible, so a failure means the mount table was corrupted before
+bring-up; `init()` panics loudly in that case rather than booting onto a
+broken root. `fs::is_initialized()` reports whether bring-up has completed.
+
+The global instance is exposed as a public static, mirroring how the
+sentinel subsystem exposes `SENTINEL`:
 
 ```rust
-VFS.mount("/dev", DevFs::new()).unwrap();
+pub static VFS: Vfs = Vfs::new();   // in fs::mod
+```
+
+After `init()`, the rest of the kernel uses the filesystem through it:
+
+```rust
+let f = fs::VFS.open(
+    "/init",
+    OpenFlags { write: true, create: true, ..OpenFlags::default() },
+)?;
+f.write(b"#!/bin/golem-init\n")?;
+```
+
+### Ordering contract — heap first
+
+**The heap MUST be initialized before `fs::init()` is called.** This
+module allocates the instant `init()` runs — the ramfs inode table and
+every directory below it live on the heap. Calling `fs::init()` before the
+global allocator is registered will fault.
+
+The agreed `kernel_main` ordering satisfies this:
+
+| Order | Subsystem | Why |
+| --- | --- | --- |
+| 1 | `sentinel::init()` | governance gate, first by mandate |
+| 2 | `memory::init(memory_map)` | **registers the heap allocator** |
+| 3 | `fs::init()` | ← us; needs the heap from step 2 |
+| 4 | `scheduler::init(...)` | needs the heap |
+| 5 | `syscall::init()` | needs the scheduler |
+
+### Crate-root requirements this module depends on (owned by Agent 7)
+
+`src/fs/` is `no_std` + `alloc`-clean (no `std::` anywhere — audited), but
+two **crate-level** declarations it cannot make itself must be present in
+the crate root (`src/main.rs`):
+
+1. `#![no_std]` — the operative no_std switch. (This module restates
+   `#![cfg_attr(not(test), no_std)]` at its top to declare intent and stay
+   consistent with the other subsystems; in a non-root module that line is
+   a harmless `unused_attributes` warning and does nothing on its own.)
+2. **`extern crate alloc;`** — required for the `use alloc::…` paths in
+   `vfs.rs` and `ramfs.rs` to resolve. This must be at the crate root:
+   declaring it in a sub-module (here, or in any sibling subsystem) does
+   **not** populate the crate-wide extern prelude, so without it at the
+   root every `alloc`-using subsystem fails to compile with `E0433`. This
+   requirement is easy to miss — it is not in Agent 7's written field list.
+
+### Adding mounts later
+
+When the device-driver agent has a devfs:
+
+```rust
+fs::VFS.mount("/dev", DevFs::new())?;
 ```
 
 The `/dev` mount shadows the corresponding directory in ramfs (longest-
@@ -234,10 +288,12 @@ process layer does not change.
 This module depends on:
 
 - `core` — implicit, always available.
-- `alloc` — for `String`, `Vec`, `BTreeMap`, `Arc`, `Box`. The kernel
-  crate that contains this module must declare `extern crate alloc;`
-  at its root and provide a global allocator (the memory agent's
-  responsibility).
+- `alloc` — for `String`, `Vec`, `BTreeMap`, `Arc`. The kernel crate that
+  contains this module **must declare `extern crate alloc;` at its root**
+  (`src/main.rs`) — not in a sub-module; a sub-module declaration does not
+  reach sibling modules (see "Crate-root requirements" above) — and must
+  provide a global allocator that is live before `fs::init()` runs (the
+  memory agent's responsibility).
 - `spin` — for `Mutex`. The de-facto kernel synchronization crate in
   the Rust ecosystem. If the sync agent later provides an in-tree
   primitive, swap the `use spin::Mutex;` lines in `vfs.rs` and
