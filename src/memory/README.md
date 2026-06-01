@@ -10,19 +10,25 @@ This subsystem brings up:
 3. **Kernel heap** (`heap.rs`)
 4. **Public interface** (`mod.rs`)
 
-The entry point is `memory::init(MemoryInfo)`. After it returns, the
-kernel has:
+The integration entry point is `memory::init(memory_map: *const ())`,
+called by Agent 7 from `kernel_main` with the boot handoff pointer.
+After it returns `Ok`, the kernel has:
 
 - A working frame allocator (`memory::allocator::alloc_frame`)
 - A working page-mapping API (`memory::paging::map / unmap / translate`)
 - A working `#[global_allocator]` — `alloc::*` collections work
+
+Callers that already hold a typed `MemoryInfo` (or unit tests) can skip
+the pointer parsing and call `memory::init_from_info(MemoryInfo)`
+directly; `init` is a thin, validating wrapper over it.
 
 ---
 
 ## Public surface
 
 ```text
-memory::init(MemoryInfo) -> Result<(), MemoryInitError>
+memory::init(memory_map: *const ()) -> Result<(), &'static str>   // integration entry
+unsafe memory::init_from_info(MemoryInfo) -> Result<(), MemoryInitError>  // structured
 
 memory::PAGE_SIZE                          usize  = 4096
 memory::HEAP_START                         usize  = 0xFFFF_C000_0000_0000
@@ -48,7 +54,24 @@ and `init()` — the heap is meant to be invisible after boot.
 
 ## Boot-time contract with the boot module
 
-`memory::init` takes a `MemoryInfo`:
+`kernel_main` receives the boot handoff pointer in `rdi` (System V
+AMD64 ABI; Agent 1's `boot.asm`) and forwards it to `memory::init` as a
+`*const ()`. That pointer must refer to a `#[repr(C)] BootHandoff`:
+
+```rust
+#[repr(C)]
+pub struct BootHandoff {
+    pub magic: u64,                  // == BOOT_HANDOFF_MAGIC ("GLMMEM01")
+    pub physical_memory_offset: u64,
+    pub region_count: u64,
+    pub regions: *const MemoryRegion, // region_count contiguous records
+}
+pub const BOOT_HANDOFF_MAGIC: u64 = 0x474C_4D4D_454D_3031;
+```
+
+`init` validates this block (null check → magic check → region-array
+sanity), then reconstructs the borrow-checked `MemoryInfo` it works
+from internally:
 
 ```rust
 pub struct MemoryInfo<'a> {
@@ -57,18 +80,31 @@ pub struct MemoryInfo<'a> {
 }
 ```
 
-Two things the boot module must guarantee before calling `init`:
+`MemoryRegion` is `#[repr(C)]` so its layout is stable across the
+asm↔Rust boundary.
 
-1. **Offset mapping is live.** All physical RAM is mapped writable at
+What the boot module must guarantee before calling `init`:
+
+1. **The handoff block is valid.** `magic == BOOT_HANDOFF_MAGIC`,
+   `regions` points to `region_count` contiguous, properly-aligned
+   `MemoryRegion`s (or is null with `region_count == 0`), and the block
+   and its array stay alive until `init` returns. `init` rejects a null
+   pointer or a bad magic with a descriptive `Err(&'static str)`.
+2. **Offset mapping is live.** All physical RAM is mapped writable at
    `physical_memory_offset`. We dereference frame addresses through this
    mapping when walking page tables.
-2. **`regions` is honest.** Any range marked `Usable` is genuinely RAM
+3. **`regions` is honest.** Any range marked `Usable` is genuinely RAM
    that nothing else cares about — not MMIO, not the kernel image, not
    bootloader scratch. We will hand pieces of these regions out as page
    tables and as heap pages.
+4. **Called once, early, IRQs off.** `init`'s signature is safe so it
+   drops into `kernel_main`, but soundness still rests on a single
+   early call with interrupts disabled (see § D3).
 
 We pessimistically refuse to allocate above `MAX_PHYSICAL_BYTES` (32 GiB
-by default — see "Decisions" below).
+by default — see "Decisions" below). On error `init` returns a
+`&'static str` (the structured `MemoryInitError` is flattened) so the
+caller can print it without depending on this module's error enum.
 
 ---
 
@@ -222,15 +258,19 @@ bit 47.
 
 ## Init order
 
-`memory::init` performs, in order:
+`memory::init(memory_map)` validates the boot handoff, builds a
+`MemoryInfo`, and hands off to `init_from_info`, which performs, in
+order:
 
 1. `paging::init(offset)` — records the physical-memory offset.
 2. `allocator::init(regions)` — populates the bitmap from the memory map.
 3. `heap::init()` — allocates frames, maps the heap region, arms the
    global allocator.
 
-The order is load-bearing: each step depends on the prior one. `init`
-takes `MemoryInfo` by value and is `unsafe` — see its docstring.
+The order is load-bearing: each step depends on the prior one.
+`init_from_info` takes `MemoryInfo` by value and is `unsafe`; the public
+`init` wrapper is safe-by-signature but carries the same call-once /
+IRQs-off contract in its docstring.
 
 ---
 
@@ -252,6 +292,33 @@ which invariant lets us soundly perform the operation. The big ones:
   problem when SMP arrives.
 
 ---
+
+## no_std
+
+This subsystem is `no_std`. Every file imports only `core::*` (plus
+`super`/`crate` paths); a full sweep finds no `std::` usage and no
+std-only macros (`println!`, `format!`, `vec!`, …).
+
+The crate-level `#![no_std]` attribute is declared **once at the crate
+root** (`src/main.rs`, owned by Agent 7 / integration), *not* in this
+module. Rust ignores `#![no_std]` in any non-root module and warns
+"the `#![no_std]` attribute can only be used at the crate root", so
+repeating it in `mod.rs` would add a build warning without changing
+behaviour. `mod.rs` documents this at the top of the file.
+
+Two related crate-root responsibilities also belong to integration, not
+to this module:
+
+- `extern crate alloc;` — needed before any `alloc::*` collection is
+  named. The heap here registers the `#[global_allocator]`; declaring
+  the `alloc` crate is the root's job.
+- The allocation-error handler. On the pinned nightly this is the
+  default `alloc_error_handler`; no per-module action is required here.
+
+`heap.rs` registers `SpinMutex<LinkedListAllocator>` as the
+`#[global_allocator]` (D5). Because the attribute lives in the heap
+module, integration does **not** need to re-register it — importing the
+`memory` module is enough to arm the global allocator at link time.
 
 ## Things that are deliberately not here
 

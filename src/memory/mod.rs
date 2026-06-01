@@ -11,6 +11,20 @@
 //!    `#[global_allocator]`.
 //!
 //! Architectural decisions are documented in `README.md`.
+//!
+//! ## `no_std`
+//!
+//! This subsystem is `no_std`: it links only `core` (and, once
+//! [`heap::init`] has run, `alloc`). It must never reach for `std` —
+//! there is no operating system underneath us to provide one. A sweep
+//! of every file here confirms only `core::*` paths are imported.
+//!
+//! The crate-level `#![no_std]` attribute itself is declared **once at
+//! the crate root** (`src/main.rs`, owned by the integration agent), not
+//! here: Rust ignores `#![no_std]` in any non-root module and warns
+//! "the `#![no_std]` attribute can only be used at the crate root", so
+//! repeating it in this `mod.rs` would add a warning without changing
+//! behaviour. See `README.md` § "no_std".
 
 #![allow(dead_code)]
 
@@ -60,7 +74,8 @@ pub enum MemoryRegionKind {
     Bootloader,
 }
 
-/// Handoff structure passed from the boot module to [`init`].
+/// Borrow-checked view of the memory map consumed by [`init_from_info`].
+/// [`init`] reconstructs one of these from the raw [`BootHandoff`].
 pub struct MemoryInfo<'a> {
     /// Virtual address at which all physical memory is identity-mapped by
     /// the bootloader. The paging module uses this to read/write page
@@ -68,6 +83,33 @@ pub struct MemoryInfo<'a> {
     pub physical_memory_offset: u64,
     pub regions: &'a [MemoryRegion],
 }
+
+/// C-ABI boot→memory handoff block — the concrete thing the raw
+/// `*const ()` handed to [`init`] points at.
+///
+/// The boot module (Agent 1) builds one of these, the firmware/boot
+/// path passes its address to `kernel_main` in `rdi`, and integration
+/// (Agent 7) forwards that address verbatim to [`init`]. It is the
+/// stable, `#[repr(C)]` wire format across the asm↔Rust boundary; the
+/// borrow-checked [`MemoryInfo`] is reconstructed from it inside `init`.
+#[repr(C)]
+pub struct BootHandoff {
+    /// Must equal [`BOOT_HANDOFF_MAGIC`]. Lets [`init`] reject a stray,
+    /// stale, or zeroed pointer before trusting any other field.
+    pub magic: u64,
+    /// Virtual base at which all physical RAM is mapped writable.
+    /// See [`MemoryInfo::physical_memory_offset`].
+    pub physical_memory_offset: u64,
+    /// Number of [`MemoryRegion`] records at `regions`.
+    pub region_count: u64,
+    /// Pointer to `region_count` contiguous, properly-aligned
+    /// `#[repr(C)]` [`MemoryRegion`]s describing the physical address
+    /// space. May be null only when `region_count == 0`.
+    pub regions: *const MemoryRegion,
+}
+
+/// Magic identifying a valid [`BootHandoff`]. ASCII `"GLMMEM01"`.
+pub const BOOT_HANDOFF_MAGIC: u64 = 0x474C_4D4D_454D_3031;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryInitError {
@@ -78,7 +120,104 @@ pub enum MemoryInitError {
     PagingNotReady,
 }
 
-/// Bring the memory subsystem online.
+/// Integration entry point — bring the memory subsystem online from the
+/// raw boot-handoff pointer that `kernel_main` receives.
+///
+/// This is the function the integration agent (Agent 7) calls from
+/// `kernel_main`:
+///
+/// ```ignore
+/// // memory_map: *const () — the rdi argument from boot.asm
+/// memory::init(memory_map)?;
+/// ```
+///
+/// It validates the [`BootHandoff`] the pointer refers to, reconstructs
+/// a [`MemoryInfo`], runs the structured [`init_from_info`] bring-up,
+/// and flattens any [`MemoryInitError`] to a `&'static str` so the
+/// caller can report it without depending on this module's error enum.
+///
+/// The signature is intentionally safe so it drops straight into
+/// `kernel_main`, but the operation is only *sound* under a caller
+/// contract this function cannot check:
+///
+/// - `memory_map` must be either null (rejected with an error) or a
+///   live, correctly-aligned [`BootHandoff`] whose `regions` /
+///   `region_count` describe a valid array;
+/// - it must be called exactly once, very early in boot, with
+///   interrupts disabled.
+///
+/// Both are guaranteed by the boot/integration contract — see
+/// `README.md` § "Boot-time contract with the boot module".
+pub fn init(memory_map: *const ()) -> Result<(), &'static str> {
+    if memory_map.is_null() {
+        return Err("memory::init: null boot handoff pointer");
+    }
+
+    // SAFETY: per the caller contract the pointer refers to a live,
+    // correctly-aligned BootHandoff. We form a shared reference and read
+    // `magic` first; every other field is only trusted once the magic
+    // check below has passed, so a zeroed or stale block is rejected
+    // before we act on its contents.
+    let handoff = unsafe { &*(memory_map as *const BootHandoff) };
+
+    if handoff.magic != BOOT_HANDOFF_MAGIC {
+        return Err("memory::init: bad boot handoff magic");
+    }
+
+    let region_count = handoff.region_count as usize;
+    let regions: &[MemoryRegion] = if region_count == 0 {
+        // A zero-length slice must not be built from a (possibly null)
+        // raw pointer — use a genuinely empty slice instead.
+        &[]
+    } else if handoff.regions.is_null() {
+        return Err("memory::init: null region array with non-zero count");
+    } else {
+        // SAFETY: the contract guarantees `regions` points to
+        // `region_count` contiguous, aligned, `#[repr(C)]`
+        // MemoryRegion records that outlive this call. MemoryRegion is
+        // `Copy`, so a shared slice over them introduces no aliasing
+        // hazard for the duration of init.
+        unsafe { core::slice::from_raw_parts(handoff.regions, region_count) }
+    };
+
+    let info = MemoryInfo {
+        physical_memory_offset: handoff.physical_memory_offset,
+        regions,
+    };
+
+    // SAFETY: forwarded under the very same "call once, early, IRQs
+    // disabled" contract documented above; `info` was just built from
+    // the validated handoff block.
+    unsafe { init_from_info(info) }.map_err(memory_init_error_str)
+}
+
+/// Render a [`MemoryInitError`] as a static, printable string for the
+/// `&'static str` boundary that [`init`] exposes to integration.
+const fn memory_init_error_str(err: MemoryInitError) -> &'static str {
+    match err {
+        MemoryInitError::NoUsableRegions => {
+            "memory::init: no usable RAM regions in the memory map"
+        }
+        MemoryInitError::BitmapTooSmall => {
+            "memory::init: physical RAM exceeds MAX_PHYSICAL_BYTES; raise the cap"
+        }
+        MemoryInitError::HeapMappingFailed => {
+            "memory::init: failed to map the kernel heap (out of frames?)"
+        }
+        MemoryInitError::AlreadyInitialized => {
+            "memory::init: memory subsystem already initialised"
+        }
+        MemoryInitError::PagingNotReady => {
+            "memory::init: invalid physical_memory_offset in boot handoff"
+        }
+    }
+}
+
+/// Bring the memory subsystem online from a structured [`MemoryInfo`].
+///
+/// This is the workhorse. Integration calls the raw-pointer [`init`]
+/// wrapper instead; this entry stays public so callers that already
+/// hold a typed `MemoryInfo` (or tests) can drive bring-up directly.
 ///
 /// Order is load-bearing: paging needs the offset before any page-table
 /// walk happens; the frame allocator must be populated before the heap
@@ -90,7 +229,7 @@ pub enum MemoryInitError {
 /// disabled. `info.regions` must accurately describe usable physical
 /// RAM, and `info.physical_memory_offset` must be a writable mapping of
 /// the entire physical address range used by the system.
-pub unsafe fn init(info: MemoryInfo<'_>) -> Result<(), MemoryInitError> {
+pub unsafe fn init_from_info(info: MemoryInfo<'_>) -> Result<(), MemoryInitError> {
     // SAFETY: caller's contract — first thing we do is record the offset
     // so the page-table walker can dereference frame addresses. Stores
     // no state beyond an atomic.

@@ -420,7 +420,12 @@ unsafe fn flush_tlb(virt: u64) {
 /// Same as `flush_tlb`. Expensive — prefer per-page flushes.
 pub unsafe fn flush_tlb_all() {
     let cr3: u64;
-    // SAFETY: control-register move is privileged but safe in ring 0.
+    // SAFETY: reading CR3 is a privileged but side-effect-free move in
+    // ring 0; `nomem` is correct because no memory is touched.
     asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+    // SAFETY: writing CR3 back with its current value reloads the page-
+    // table base unchanged, whose only architectural effect is flushing
+    // every non-global TLB entry — exactly the intent of this function.
+    // The active L4 is unchanged, so no mapping is altered.
     asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
 }
