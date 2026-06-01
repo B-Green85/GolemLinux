@@ -1,8 +1,9 @@
 //! Syscall dispatcher.
 //!
-//! `entry.asm` translates the Linux x86_64 register ABI into the SysV C ABI
-//! and calls [`syscall_dispatch`] with the syscall number plus six argument
-//! registers. This module routes that call to the correct Tier 1 handler.
+//! The `global_asm!` trampoline in `entry.rs` translates the Linux x86_64
+//! register ABI into the SysV C ABI and calls [`syscall_dispatch`] with the
+//! syscall number plus six argument registers. This module routes that call to
+//! the correct Tier 1 handler.
 //!
 //! The dispatch table is a fixed-size array indexed by syscall number. This
 //! mirrors how Linux organizes `sys_call_table` and keeps dispatch to a
@@ -94,7 +95,7 @@ pub fn init() {
     }
 }
 
-/// Entry point called from `entry.asm`.
+/// Entry point called from the `entry.rs` `global_asm!` trampoline.
 ///
 /// Uses the SysV C ABI: nr in rdi, args in rsi/rdx/rcx/r8/r9, plus arg5 on
 /// the stack. `extern "C"` makes that mapping explicit so the assembly side

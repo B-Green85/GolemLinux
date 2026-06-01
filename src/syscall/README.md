@@ -9,15 +9,20 @@ This subsystem is the user/kernel boundary for Golem Linux. It is **bit-for-bit 
 
 ## File layout
 
-| File           | Language    | Role                                                            |
-| -------------- | ----------- | --------------------------------------------------------------- |
-| `entry.asm`    | NASM x86_64 | `SYSCALL` entry/exit, stack swap, ABI translation, MSR setup    |
-| `dispatch.rs`  | Rust        | Dispatch table, syscall number constants, errno flattening      |
-| `handlers.rs`  | Rust        | Tier 1 handlers, boundary validation                            |
-| `mod.rs`       | Rust        | Public surface and bring-up entry point                         |
-| `README.md`    | Markdown    | This document                                                   |
+| File           | Language          | Role                                                                       |
+| -------------- | ----------------- | -------------------------------------------------------------------------- |
+| `entry.rs`     | Rust + `global_asm!` | `SYSCALL` entry/exit trampoline (stack swap, ABI translation) + MSR setup |
+| `dispatch.rs`  | Rust              | Dispatch table, syscall number constants, errno flattening                 |
+| `handlers.rs`  | Rust              | Tier 1 handlers, boundary validation                                       |
+| `mod.rs`       | Rust              | Public surface and bring-up entry point                                    |
+| `README.md`    | Markdown          | This document                                                              |
 
-The boundary between assembly and Rust is exactly one symbol: `entry.asm` calls `syscall_dispatch` (defined in `dispatch.rs`) with the SysV C ABI. Everything below `syscall_dispatch` is Rust; everything above (CPU state, segment selectors, MSRs, stack swap) is assembly. This split is deliberate — Rust cannot soundly express SYSCALL entry conditions (interrupts off, wrong stack, half-restored segments), and assembly cannot soundly express the high-level handler logic. Each language stays where it has a sound model.
+> **Phase 2 change.** The entry path used to live in a standalone NASM file
+> (`entry.asm`). It now lives in `entry.rs` as a `global_asm!` block plus Rust
+> MSR programming. See [Phase 2 integration changes](#phase-2-integration-changes)
+> for why.
+
+The boundary between assembly and Rust is exactly one symbol: the `global_asm!` trampoline in `entry.rs` calls `syscall_dispatch` (defined in `dispatch.rs`) with the SysV C ABI. Everything below `syscall_dispatch` is high-level Rust; the trampoline above it (CPU state, segment selectors, stack swap) is assembly, and the MSR programming that arms it (`init_cpu`) is Rust driving `rdmsr`/`wrmsr`. This split is deliberate — Rust cannot soundly express SYSCALL *entry conditions* (interrupts off, wrong stack, half-restored segments), so the trampoline stays in assembly; but the MSR writes have a perfectly sound Rust model, so they move to Rust where the LSTAR address can be taken directly from the linked `syscall_entry` symbol. Each piece stays where it has a sound model.
 
 ---
 
@@ -127,7 +132,38 @@ Linux's x86_64 table currently uses ~450 entries with room reserved up through t
 
 ### 13. Single `init()` entry point in `mod.rs`
 
-Bring-up has a strict order: install handlers, *then* arm the MSRs. If the order flipped, the very first SYSCALL after `wrmsr LSTAR` could land in an empty dispatch table. One public function enforces the order so bring-up code (owned by another agent) cannot get it wrong.
+Bring-up has a strict order: install handlers, *then* arm the MSRs. If the order flipped, the very first SYSCALL after `wrmsr LSTAR` could land in an empty dispatch table. One public function enforces the order so bring-up code (owned by another agent) cannot get it wrong. `init()` is `unsafe` and documents the CPL 0 + long-mode contract — see [Phase 2 integration changes](#phase-2-integration-changes).
+
+---
+
+## Phase 2 integration changes
+
+Phase 2's job for this subsystem was "compile under `no_std`, wire correctly to the CPU." Findings and changes, all confined to `src/syscall/`:
+
+### a. Entry trampoline moved from `entry.asm` (NASM) to `entry.rs` (`global_asm!`)
+
+**Why this was mandatory, not cosmetic.** `gkern` builds with `cargo build --target x86_64-unknown-none` and has **no `build.rs` and no NASM step** (Agent 7's integration files are `Cargo.toml`, `src/main.rs`, `.cargo/config.toml`, `rust-toolchain.toml` — none assemble `.asm`). A standalone `entry.asm` would therefore never be assembled or linked: `syscall_entry` would not exist in the kernel binary, and `IA32_LSTAR` would be armed to point at nothing. The trampoline is now embedded via `global_asm!` (AT&T syntax, `options(att_syntax)`), exactly matching the established in-repo convention in `src/scheduler/context.rs`. The instruction sequence is a faithful port of the Phase 1 NASM (same stack swap, same trap-frame layout, same Linux→SysV register shuffle, same `sysretq`). `entry.asm` was removed to keep a single source of truth.
+
+### b. MSR programming moved into Rust `init()` (`entry::init_cpu`)
+
+The four SYSCALL MSRs (`EFER.SCE`, `STAR`, `LSTAR`, `FMASK`) are now programmed from Rust via `rdmsr`/`wrmsr` inline `asm!`, reachable through the public `syscall::init()`. The win: `IA32_LSTAR` is written with `syscall_entry as usize as u64` — the address comes **directly from the linked symbol**, so it can never drift from the code it names (the old NASM hand-computed it with `lea`/`shr`). `EFER` is read-modify-written so the boot agent's `EFER.LME/LMA/NXE` survive; we only set `SCE`.
+
+### c. CPL 0 + long mode (privilege requirement — documented per the constraint)
+
+`rdmsr`/`wrmsr` are **privileged instructions**: executing them at any CPL other than 0 raises `#GP(0)`. They also assume the CPU is already in 64-bit long mode. Both conditions hold where Agent 7 calls `syscall::init()` from `kernel_main` (ring 0, long mode established by the boot agent). This is why `init()` and `init_cpu()` are `unsafe` and spell the contract out in their doc comments. **MSR writes must happen at CPL 0, after long mode — never from userspace.**
+
+### d. `no_std` audit
+
+No `std::`, `use std`, or `extern crate std` appears anywhere in `src/syscall/` — handlers already used `core::` (`core::mem`, `core::convert::Infallible`) and the new `entry.rs` uses only `core::arch`. The module carries `#![cfg_attr(not(test), no_std)]` to document intent and allow host unit tests, but note: a crate-level attribute on a non-root *module* is inert; the **authoritative `#![no_std]` belongs to the crate root (`src/main.rs`, Agent 7)**. None of the sibling subsystems put `#![no_std]` in their `mod.rs` either, for the same reason. The real guarantee is the absence of `std` usage, which holds.
+
+### e. Syscall numbers verified against the Linux x86_64 ABI
+
+`read=0, write=1, open=2, close=3, fork=57, execve=59, exit=60` — all match `arch/x86/entry/syscalls/syscall_64.tbl`. No drift. Unchanged.
+
+### Cross-agent notes
+
+- The `extern "C"`-symbol contract with the rest of the kernel is unchanged: assembly still calls `syscall_dispatch`, and the entry symbol is still named `syscall_entry`. Only the *source form* changed (NASM → `global_asm!`).
+- The GDT/`STAR_VALUE` and per-CPU `GS:[0]` assumptions in the [interfaces table](#interfaces-this-subsystem-expects-from-other-agents) are unchanged — they moved verbatim into `entry.rs`.
 
 ---
 
@@ -135,8 +171,8 @@ Bring-up has a strict order: install handlers, *then* arm the MSRs. If the order
 
 | Provided by                 | Symbol / fact                                                                  | Used where                  |
 | --------------------------- | ------------------------------------------------------------------------------ | --------------------------- |
-| Memory / CPU bring-up agent | Per-CPU area mapped, `GS_BASE` pointing at it, `GS:[0] = kernel_rsp`           | `entry.asm` prologue        |
-| Memory / GDT agent          | GDT layout matching the STAR value: kernel CS at 0x08, user CS64 at 0x28+RPL3  | `entry.asm` STAR constant   |
+| Memory / CPU bring-up agent | Per-CPU area mapped, `GS_BASE` pointing at it, `GS:[0] = kernel_rsp`           | `entry.rs` trampoline prologue |
+| Memory / GDT agent          | GDT layout matching the STAR value: kernel CS at 0x08, user CS64 at 0x28+RPL3  | `entry.rs` `STAR_VALUE`     |
 | VFS agent (feature `vfs`)   | `vfs_read`, `vfs_write`, `vfs_open`, `vfs_close` with documented signatures    | `handlers.rs`               |
 | Process agent (feature `process`) | `proc_fork`, `proc_execve`, `proc_exit`                                  | `handlers.rs`               |
 
