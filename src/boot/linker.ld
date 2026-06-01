@@ -16,7 +16,29 @@
  * boot.asm of this directory) parses this ELF, copies each PT_LOAD segment
  * to the virtual address recorded here, zero-initialises .bss, installs page
  * tables matching the per-section permissions below, and jumps to the symbol
- * `_kernel_start`. From that moment, UEFI Boot Services no longer exist.
+ * `kernel_main`. From that moment, UEFI Boot Services no longer exist.
+ *
+ * Kernel entry handoff ABI (Phase 2 contract — Agent 1 ⇄ Agent 7)
+ * ---------------------------------------------------------------
+ * The bootloader→kernel jump is a System V AMD64 control transfer, NOT the
+ * Microsoft x64 (efiapi) convention used at the UEFI entry in boot.asm. The
+ * Rust kernel ELF is built for x86_64-unknown-none, whose default ABI is
+ * System V, so `kernel_main` is reached with:
+ *
+ *     RDI = pointer to the captured UEFI memory map (first argument)
+ *
+ * `kernel_main` is owned and defined by Agent 7 (src/main.rs); it is NOT
+ * defined in this directory. This script only NAMES it as the ELF entry so
+ * Agent 7's symbol is what the loader records in e_entry and what the
+ * bootloader jumps to. Equivalent Rust declaration Agent 7 must provide:
+ *
+ *     #[no_mangle]
+ *     pub extern "C" fn kernel_main(memory_map: *const ()) -> !;
+ *
+ * The opaque `*const ()` matches the memory subsystem's
+ * `memory::init(memory_map: *const ()) -> Result<(), &'static str>` (Agent 2),
+ * which `kernel_main` forwards RDI to. See README.md §"Phase 2 integration
+ * review" for the full convention chain.
  *
  * Virtual address space layout
  * ----------------------------
@@ -46,7 +68,16 @@
 
 OUTPUT_FORMAT(elf64-x86-64)
 OUTPUT_ARCH(i386:x86-64)
-ENTRY(_kernel_start)
+
+/*
+ * Kernel ELF entry point. Renamed from `_kernel_start` to `kernel_main` in
+ * Phase 2 to match the integration-agreed entry symbol (Agent 7, src/main.rs).
+ * ASSUMPTION (must hold for boot to succeed): the kernel crate defines a
+ * `#[no_mangle] pub extern "C" fn kernel_main(...)`, and its first-instruction
+ * function is placed in `.text.boot` (KEEPt at the start of .text below) so
+ * the bootloader can jump to KERNEL_BASE + headers without parsing e_entry.
+ */
+ENTRY(kernel_main)
 
 KERNEL_BASE = 0xFFFFFFFF80000000;
 PAGE_SIZE   = 0x1000;                 /* 4 KiB */

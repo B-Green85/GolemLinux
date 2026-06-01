@@ -10,7 +10,7 @@
 This directory holds the Assembly entry point of the Golem bootloader and the
 linker script for the Golem kernel. The Rust portion of the bootloader (the
 code that walks the UEFI memory map, exits boot services, sets up paging,
-loads the kernel ELF, and jumps to `_kernel_start`) belongs to a peer
+loads the kernel ELF, and jumps to `kernel_main`) belongs to a peer
 subsystem and is intentionally absent here — these two files plus this
 document are the bootloader subsystem's complete deliverable.
 
@@ -51,12 +51,13 @@ and intentionally so: see *§Why a separate bootloader binary*.
                                                         │ segments to
                                                         │ KERNEL_BASE,
                                                         │ zero .bss,
-                                                        │ jump
+                                                        │ jmp (System V,
+                                                        │  RDI = memory map)
                                                         ▼
                                                ┌──────────────────┐
-                                               │ _kernel_start    │
+                                               │ kernel_main      │
                                                │ (gkern ELF,      │ ← not in
-                                               │  linker.ld)      │   this dir
+                                               │  linker.ld ENTRY)│   this dir
                                                └──────────────────┘
 ```
 
@@ -128,6 +129,90 @@ and the MSB indicates error).
 
 Rust's `extern "efiapi"` matches Microsoft x64 exactly. `efi_main`
 therefore performs no register shuffling — it forwards control directly.
+
+---
+
+## Phase 2 integration review
+
+*Reviewed 2026-06-01 (Agent 1) against the integration-agreed kernel entry
+symbol `kernel_main` (Agent 7, `src/main.rs`).*
+
+### Outcome
+
+| File        | Action  | Reason                                                       |
+| ----------- | ------- | ------------------------------------------------------------ |
+| `boot.asm`  | **none** | Already correct; changing it would break the boot path. See below. |
+| `linker.ld` | renamed `ENTRY` | `_kernel_start` → `kernel_main` so the agreed symbol is the kernel ELF entry. |
+| `README.md` | updated | This section + symbol references reconciled to `kernel_main`. |
+
+### Why `boot.asm` is correct as-is and was *not* changed
+
+The Phase 2 brief asked to "ensure `boot.asm` calls `kernel_main` and passes
+the UEFI memory map in `RDI` (System V)." Applied literally to `boot.asm`
+that is **not implementable**, because `boot.asm` is the **UEFI application
+entry**, not the kernel entry. Golem uses a deliberate **two-binary** design
+(see *§Why a separate bootloader binary*), which puts three independent facts
+in the way:
+
+1. **Wrong calling convention at this boundary.** `efi_main` runs under
+   Microsoft x64 (`efiapi`); firmware delivers `RCX`/`RDX`, and the System V
+   `RDI` is not an input register here. Forcing a `RDI` argument at `efi_main`
+   would corrupt the firmware handoff.
+2. **The memory map does not exist yet.** It is produced by `GetMemoryMap()`
+   *inside the Rust bootloader*, after `efi_main` returns — see *§UEFI handoff
+   assumptions → Memory & paging*. There is nothing to place in `RDI` at the
+   UEFI entry.
+3. **`kernel_main` is in a different binary.** It lives in the kernel ELF,
+   loaded and relocated to `KERNEL_BASE` *after* `ExitBootServices()`. The
+   transfer to it is a `jmp` performed by the Rust bootloader, not a `call`
+   from this UEFI stub.
+
+`boot.asm`'s job — forward the firmware handoff to `bootloader_main` with
+arguments intact and touch nothing else — is exactly right, so it is left
+unchanged.
+
+### Where the `kernel_main` / System V / `RDI` contract actually lives
+
+The requirement is real; it just belongs to the **bootloader → kernel** jump,
+not to `boot.asm`. That jump targets `kernel_main` (the `linker.ld` `ENTRY`)
+and, because the kernel ELF is built for `x86_64-unknown-none` (System V by
+default), passes its argument in `RDI`:
+
+| Boundary                     | Convention      | Arg registers / handoff                              |
+| ---------------------------- | --------------- | ---------------------------------------------------- |
+| UEFI firmware → `efi_main`   | Microsoft x64   | `RCX`=ImageHandle, `RDX`=SystemTable                 |
+| `efi_main` → `bootloader_main` | Microsoft x64 (`efiapi`) | forwarded untouched (`RCX`,`RDX`)         |
+| `bootloader_main` → `kernel_main` | **System V AMD64** | `RDI` = pointer to captured UEFI memory map     |
+
+The Rust bootloader (peer subsystem) is the party that satisfies the System V
+`RDI` contract; this directory's contribution is to **name** the entry
+`kernel_main` in `linker.ld` so that contract resolves to Agent 7's symbol.
+
+### Contract for Agent 7 (`src/main.rs`)
+
+`kernel_main` is owned by Agent 7 and is **not** defined here. To match the
+`ENTRY` symbol and the System V handoff above, it must be:
+
+```rust
+#[no_mangle]
+pub extern "C" fn kernel_main(memory_map: *const ()) -> ! {
+    // memory_map arrives in RDI; forward it to the memory subsystem.
+    // sentinel::init() first, then memory::init(memory_map), ...
+}
+```
+
+The opaque `*const ()` deliberately matches Agent 2's
+`memory::init(memory_map: *const ()) -> Result<(), &'static str>`, which
+`kernel_main` forwards `RDI` to. The pointer is opaque to the boot subsystem;
+its concrete layout (descriptor array base, descriptor size, count) is the
+memory map ABI owned jointly by the Rust bootloader and the memory subsystem.
+
+> **Cross-agent note.** Phase 1 named the kernel entry `_kernel_start`; Phase 2
+> renamed it to `kernel_main` to match the agreed integration symbol. Nothing
+> outside `src/boot/` referenced `_kernel_start`, so the rename is safe. If the
+> peer Rust bootloader subsystem hard-codes the entry name (rather than reading
+> `e_entry` / jumping to the `.text.boot` offset), it must be updated to
+> `kernel_main` as well.
 
 ---
 
@@ -244,7 +329,7 @@ they have no value of their own.
 | `__data_start/_end`     | Bounds of `.data`.                        |
 | `__bss_start/_end`      | Bounds of `.bss` — bootloader zeroes this.|
 | `__kernel_image_end`    | One past the highest used virtual byte.   |
-| `_kernel_start`         | Kernel entry; defined by the kernel crate.|
+| `kernel_main`           | Kernel ELF entry (`ENTRY`); defined by Agent 7's kernel crate, reached via System V with `RDI` = memory map. |
 
 ### `.text.boot`
 
