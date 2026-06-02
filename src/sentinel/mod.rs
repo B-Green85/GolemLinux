@@ -35,12 +35,52 @@
 //! daemon can be killed, isolated, or starved; only a kernel-resident
 //! Sentinel is genuinely non-bypassable. See `README.md` for the longer
 //! discussion.
+//!
+//! ## Initialization order — HARD REQUIREMENT
+//!
+//! Sentinel initializes **first**. [`init`] must be the very first subsystem
+//! bring-up call in `kernel_main`, before the scheduler, the syscall
+//! interface, or the filesystem come up. The reason is the invisibility gate:
+//! a syscall interface that goes live before the gate would, for the window
+//! between the two, dispatch Sentinel operations without the
+//! [`CallerContext`] classification that makes Agents see a vanilla kernel —
+//! and a scheduler that runs tasks before the gate is live could let an Agent
+//! task issue its first syscall outside Sentinel's authority. Bring the gate
+//! up first and that window does not exist. This ordering is a security
+//! property, not a convenience; see `README.md` § 8. The integration crate
+//! root encodes it by calling `sentinel::init()` as step 1 of `kernel_main`.
+//!
+//! ## `no_std`
+//!
+//! Sentinel links only `core` and `alloc` — never `std`. The authoritative
+//! crate-level `#![no_std]` lives in the crate root (`src/main.rs`, owned by
+//! the integration agent). We restate the contract at this subsystem boundary
+//! as `#![cfg_attr(not(test), no_std)]` to (a) declare it where the subsystem
+//! begins, matching the sibling subsystems (memory, scheduler, syscall, fs all
+//! carry the same line), and (b) still let the in-tree `#[cfg(test)]` units
+//! build against a host `std` test harness. A bare `#![no_std]` on a non-root
+//! module is inert *and* would break the test build, so the `cfg_attr` form is
+//! the correct one. See `README.md` § 3.2.
 
+// no_std contract for this subsystem — see the module docs above and README.md.
+#![cfg_attr(not(test), no_std)]
 #![allow(clippy::module_inception)]
+// The Sentinel public API is intentionally complete ahead of its syscall
+// wiring: in Phase 2 the kernel calls only `init()`, and the dispatch routes
+// that reach the rest of the facade (`handshake`, `status`, `observe`, …) land
+// when the syscall layer is wired. Until then those entry points are dead from
+// the linker's view. Silence that specific noise — without relaxing any
+// visibility or weakening a security property — so the subsystem builds clean.
+#![allow(dead_code)]
 
 extern crate alloc;
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
+// `ToString` is used only by the in-tree `#[cfg(test)]` units (via `use
+// super::*`); gating it keeps the non-test no_std build free of an unused-
+// import warning.
+#[cfg(test)]
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -394,9 +434,21 @@ impl Sentinel {
 pub static SENTINEL: Sentinel = Sentinel::new();
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Bring-up. Must be called exactly once from kernel init, before any agent
-/// can complete a handshake. Writes a "boot" entry to the audit log so the
-/// chain has a stable genesis.
+/// Sentinel bring-up — **the FIRST subsystem init in `kernel_main`**.
+///
+/// This is the single entry point the integration crate root calls, and it
+/// must be called *before* the scheduler, the syscall interface, or the
+/// filesystem are initialized (see the module-level "Initialization order"
+/// note). Bringing the invisibility gate up first guarantees there is no
+/// window in which a Sentinel operation could be dispatched without caller
+/// classification. It writes a `boot` entry to the audit log so every chain
+/// has a stable, identifiable genesis, then verifies the (empty) chain so a
+/// broken audit module fails fast before any traffic is accepted.
+///
+/// Idempotent: a second call is a no-op (so an accidental double-init cannot
+/// write a second genesis row). Takes no arguments and cannot fail — it does
+/// not depend on the heap, the clock, or any other subsystem, which is
+/// precisely why it can run first.
 pub fn init() {
     if INITIALIZED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

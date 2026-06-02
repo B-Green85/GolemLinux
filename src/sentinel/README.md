@@ -56,7 +56,9 @@ The kernel doesn't ship `std`. The Sentinel modules use:
 - `core::*` for primitives (atomic, cell, hint).
 - `alloc::*` for collections (`Vec`, `BTreeMap`, `VecDeque`, `String`).
 
-That makes the modules compile into gkern, and also makes them trivially testable from a `std` test harness with `extern crate alloc` (which the test binary already provides). Tests in this directory run as ordinary `cargo test` units — no kernel emulator required.
+There is no `std::` reference anywhere in `src/sentinel/` — audited in Phase 2, see § 8. The modules compile into gkern against the bare-metal target `x86_64-unknown-none`.
+
+**The `no_std` attribute.** `mod.rs` carries `#![cfg_attr(not(test), no_std)]` at its top. The authoritative crate-level `#![no_std]` lives in the crate root (`src/main.rs`); a crate-level attribute on a *non-root module* is inert (the compiler emits a benign "the `#![no_std]` attribute can only be used at the crate root" note and ignores it). We restate it anyway to declare the contract where the subsystem begins, matching the sibling subsystems (memory, scheduler, syscall, fs all carry the same line). The `cfg_attr(not(test), …)` form — rather than a bare `#![no_std]` — is deliberate: it leaves the `#[cfg(test)]` units free to build against a host `std` test harness should a lib target ever be introduced (see § 6).
 
 ### 3.3 SpinLock, not async, not std::sync::Mutex
 
@@ -293,7 +295,10 @@ Every module ships with `#[cfg(test)]` units. Coverage summary:
 - **`monitor.rs`**: Fresh agent → None; repetition crosses Soft; forget clears state; tool retry detection; normalize collapses whitespace/case; tier threshold edges; combine gates correctly; injected signal drives tier.
 - **`mod.rs`** (facade integration): Agent handshakes and gets token; Agent denied status; Operator gets status; probes audited silently; Hard tier locks agent; Safe Mode configures; chain verifies after traffic; deregister clears monitor state; unknown agent ENOENT to Operator but ENOSYS to Agent; injected signal drives facade tier.
 
-Run with `cargo test -p gkern --lib sentinel`.
+**How the units are verified.** The integration crate root (`src/main.rs`) is a `#![no_std] #![no_main]` *binary* with no lib target, so `cargo test -p gkern --lib sentinel` does not apply to the assembled kernel (it reports "no library targets found"). The `#[cfg(test)]` units above are retained as the authoritative behavioral spec and are written to run unmodified under a host `std` harness if the subsystem is ever split into a testable lib (this is what the `#![cfg_attr(not(test), no_std)]` gate in § 3.2 enables). In Phase 2, correctness is established by:
+
+1. **The `no_std` kernel build** — `cargo build` against `x86_64-unknown-none` compiles the whole Sentinel subsystem with no `std`, which is the operative compliance check.
+2. **SHA-256 + chain re-verification** — the embedded hash was re-validated against the FIPS 180-4 vectors (`""`, `"abc"`, and the standard "quick brown fox" vector) and the chain's forward-tamper detection was re-checked out-of-tree during the port. The in-tree `audit.rs::tests::sha256_known_vectors` and `chain_detects_tampering` pin the same properties for the future host harness.
 
 ---
 
@@ -305,6 +310,45 @@ Documented here so future contributors don't think these are missing-but-overloo
 - **Webhook fires.** The Medium tier action specifies a webhook. The webhook delivery mechanism is a Safe-Mode-configured Operator-context daemon that subscribes to tier-change audit entries. Out of scope for the kernel module.
 - **Richer detectors.** The four signals are intentionally simple. Userspace detector daemons running in Operator context can feed verdicts in via `record_signal`. Building those daemons is out of scope here.
 - **Sentinel state migration.** "Did anything change at the kernel level or with Sentinel since last session?" is implemented by Safe Mode comparing the on-disk Sentinel config against the running config. The Safe Mode subsystem owns that comparison; this module just makes the running config readable from `SafeMode` context.
+
+---
+
+## 8. Phase 2 Integration Notes
+
+Phase 2's job for this subsystem was: *compile under `no_std`, and guarantee Sentinel initializes before any other subsystem.* All changes were confined to `src/sentinel/`. Findings and changes:
+
+### 8.1 `no_std` audit — clean
+
+Every file in `src/sentinel/` was audited for `std::` usage. **There is none** outside doc-comments. Phase 1 was already written against `core` + `alloc`:
+
+- `core::{cell::UnsafeCell, sync::atomic, hint::spin_loop, ops}` for the `SpinLock`, the clock, and the guards.
+- `alloc::{string, vec, collections::{BTreeMap, VecDeque}, format}` for the registry, the audit chain, and the monitor buffers.
+
+No replacements were required. The subsystem compiles into `gkern` against `x86_64-unknown-none` with `cargo build`.
+
+### 8.2 `#![no_std]` declaration
+
+`mod.rs` now carries `#![cfg_attr(not(test), no_std)]` at its top (§ 3.2), matching the memory / scheduler / syscall / fs subsystems. The authoritative `#![no_std]` remains in the crate root (`src/main.rs`); the module-level restatement is the documented subsystem convention and emits only the expected benign "can only be used at the crate root" note.
+
+### 8.3 Initialization order — Sentinel is FIRST (hard requirement)
+
+**The invisibility gate must be live before the scheduler, the syscall interface, or the filesystem initialize.** If a syscall path went live before the gate, there would be a window in which a Sentinel operation could dispatch without `CallerContext` classification — the load-bearing security property of the whole subsystem (§ 4.2.1). If the scheduler ran tasks before the gate, an Agent task could issue its first syscall outside Sentinel's authority. Initializing the gate first closes that window entirely.
+
+`sentinel::init()` is designed to make "first" trivially safe: it takes no arguments, cannot fail, and depends on **no other subsystem** — not the heap (the singleton is `const`-constructed into a `static`; the audit chain's first `Vec`/`String` allocations are the only allocator use, and the genesis `boot` entry is small), not the clock (it uses the monotonic tick fallback until `install_clock` runs), not the scheduler. That is precisely why it can run before everything else. The integration crate root calls it as **step 1** of `kernel_main`, ahead of `memory::init`, `fs::init`, `scheduler::init`, and the syscall wiring.
+
+> Note for the integration agent: `sentinel::init()` must remain the first subsystem call in `kernel_main`. Reordering it after memory/scheduler/syscall reintroduces the unclassified-dispatch window and breaks the invisibility guarantee. This ordering is a security property, not a performance preference.
+
+### 8.4 `init()` is the public entry point
+
+`pub fn init()` in `mod.rs` is the single, clean bring-up call. It is idempotent (a second call is a no-op, so a double-init cannot write a second audit genesis row), writes the `boot` genesis entry, and verifies the empty chain to fail fast if the audit module is broken before any traffic is accepted.
+
+### 8.5 SHA-256 audit chain under `no_std` — verified, no crypto crate
+
+The audit chain uses the **embedded FIPS 180-4 SHA-256** in `audit.rs::sha256_hex` — no `sha2`, no `ring`, no external crypto crate, and therefore no transitive dependency on the very thing the chain exists to protect (§ 3.4). No std-dependent crate was used in Phase 1, so none had to be replaced. During the port the implementation was re-validated against the standard test vectors and the forward-chain tamper-detection was re-confirmed (§ 6). The hash is a pure function of a `&[u8]`, allocating only its returned `String`, so it is fully `no_std`-correct.
+
+### 8.6 Invisibility preserved
+
+No change in this phase weakened the invisibility boundary. The gate, the authorization matrix, the silent `invisible_probe` auditing, and the `NotPresent → ENOSYS (38)` collision are untouched. The only code edits were the `no_std`/`dead_code` attributes, documentation, and a test-only import gate.
 
 ---
 

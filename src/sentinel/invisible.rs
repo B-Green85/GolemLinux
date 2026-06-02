@@ -102,7 +102,7 @@ impl InvisibleError {
     /// Map to the Linux errno convention used by the syscall layer. We
     /// deliberately use the same errno for `NotPresent` as for an unwired
     /// syscall slot: that's the invisibility contract.
-    pub const fn to_errno(self) -> i64 {
+    pub const fn to_errno(&self) -> i64 {
         match self {
             InvisibleError::NotPresent => 38, // ENOSYS
             InvisibleError::Forbidden(_) => 1, // EPERM
