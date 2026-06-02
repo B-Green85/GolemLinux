@@ -1,6 +1,6 @@
 # `src/fs/` — Golem Linux Filesystem Layer
 
-**Copyright (c) 2026 TrueSystems LLC. All rights reserved.**
+*Copyright © 2026 Brandon Green. Licensed under the Apache 2.0 License.*
 
 Agent 5 of 6 — filesystem layer. Sibling agents own the other kernel
 subsystems; this directory is self-contained and touches nothing outside

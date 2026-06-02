@@ -192,4 +192,4 @@ If a future bug looks like it lives in this directory but the root cause is in o
 
 ---
 
-*Part of Golem Linux. Copyright (c) 2026 TrueSystems LLC.*
+*Copyright © 2026 Brandon Green. Licensed under the Apache 2.0 License.*

@@ -3,7 +3,7 @@
 **Subsystem owner:** Agent 1 (bootloader)
 **Scope:** every file in this directory; nothing outside it.
 
-*Copyright (c) 2026 TrueSystems LLC. All rights reserved.*
+*Copyright © 2026 Brandon Green. Licensed under the Apache 2.0 License.*
 
 ---
 

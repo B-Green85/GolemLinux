@@ -352,5 +352,5 @@ No change in this phase weakened the invisibility boundary. The gate, the author
 
 ---
 
-*Copyright (c) 2026 TrueSystems LLC. All rights reserved.*
+*Copyright © 2026 Brandon Green. Licensed under the Apache 2.0 License.*
 *Golem Linux is developed under the CDMAE methodology.*

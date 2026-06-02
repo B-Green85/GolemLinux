@@ -346,4 +346,4 @@ module, integration does **not** need to re-register it — importing the
 
 ---
 
-*Copyright (c) 2026 TrueSystems LLC.*
+*Copyright © 2026 Brandon Green. Licensed under the Apache 2.0 License.*
