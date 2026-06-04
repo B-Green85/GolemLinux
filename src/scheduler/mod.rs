@@ -24,6 +24,17 @@
 //!   callee-saved set.
 //! * Providing kernel stacks (as `Box<[u8]>`) to `spawn` and `init`.
 
+// no_std: every path in this subsystem resolves through `core` or `alloc`;
+// `std` is never referenced (audited in Phase 2). The *authoritative*
+// `#![no_std]` for the kernel lives in the crate root (`src/main.rs`, owned by
+// the integration agent). This crate-level attribute mirrors the convention
+// the sibling subsystems use (see `syscall/mod.rs`) and keeps the module
+// std-free under `cargo test`, where `std` is linked for the test harness —
+// hence the `not(test)` guard. As an inner attribute in a non-root module it
+// is a no-op for the real kernel build; the no_std guarantee here is enforced
+// by the imports, not by this line.
+#![cfg_attr(not(test), no_std)]
+
 pub mod context;
 pub mod process;
 pub mod scheduler;
@@ -36,7 +47,62 @@ pub use scheduler::{SchedError, Scheduler, DEFAULT_TIME_SLICE, SCHEDULER};
 use alloc::boxed::Box;
 use alloc::string::String;
 
-/// Initialize the scheduler.
+/// Kernel stack size for the built-in idle task, in bytes. The idle loop does
+/// nothing but `hlt`, so it needs no real working set; one 4 KiB page is the
+/// recommended floor from `init_with` and leaves ABI headroom.
+const IDLE_STACK_SIZE: usize = 4096;
+
+/// Owner ID recorded for kernel-internal tasks (the bootstrap thread and the
+/// built-in idle task) until Sentinel resolves the real kernel principal. Zero
+/// is reserved for "the kernel itself" and is never handed to a user process.
+pub const KERNEL_OWNER: OwnerId = 0;
+
+/// Built-in idle entry point: halt until the next interrupt, forever.
+///
+/// Used by the zero-argument [`init`] so the integration layer does not have to
+/// supply a power-management entry of its own. `extern "C"` and `-> !` to match
+/// [`EntryFn`]. Callers that have their own idle/power-management routine can
+/// bypass this by calling [`init_with`] instead.
+extern "C" fn idle_loop() -> ! {
+    loop {
+        // SAFETY: `hlt` merely halts the CPU until the next interrupt. It has
+        // no memory effects and is valid at CPL 0, where every kernel task
+        // (idle included) runs. `nomem`/`nostack` reflect that it touches
+        // neither; it leaves interrupts and flags untouched.
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// Initialize the scheduler — the entry point the integration layer calls from
+/// `kernel_main`.
+///
+/// Takes no arguments: it allocates the idle task's kernel stack from the
+/// global heap and installs the built-in [`idle_loop`] as the idle entry, with
+/// [`KERNEL_OWNER`] as the placeholder accountability ID.
+///
+/// # Ordering dependency
+///
+/// **Memory must be initialized first.** This function allocates from the
+/// global heap (the idle stack); calling it before `memory::init` has
+/// registered the `#[global_allocator]` will fault. In `kernel_main` the order
+/// is: `sentinel::init` → `memory::init` → … → `scheduler::init`.
+///
+/// Must be called exactly once. Installs the idle task and records the
+/// currently-executing kernel thread as the bootstrap PCB so the first context
+/// switch off it has somewhere to save state.
+pub fn init() -> Result<(), SchedError> {
+    // Allocated from the global heap — requires memory::init to have run.
+    let idle_stack: Box<[u8]> = alloc::vec![0u8; IDLE_STACK_SIZE].into_boxed_slice();
+    init_with(KERNEL_OWNER, idle_stack, idle_loop)
+}
+
+/// Initialize the scheduler with caller-supplied idle parameters.
+///
+/// The general form behind [`init`]. Use this when the kernel wants to provide
+/// its own idle/power-management entry, a pre-allocated idle stack, or a
+/// specific owner ID rather than the [`KERNEL_OWNER`] placeholder.
 ///
 /// Must be called exactly once during kernel bootstrap, before any other
 /// scheduler API. Installs the idle task and records the currently-executing
@@ -49,7 +115,7 @@ use alloc::string::String;
 ///   4 KiB is the recommended floor.
 /// * `idle_entry` — entry point for the idle process. Conventionally a
 ///   `loop { hlt }` provided by the kernel's power-management module.
-pub fn init(
+pub fn init_with(
     bootstrap_owner: OwnerId,
     idle_stack: Box<[u8]>,
     idle_entry: EntryFn,

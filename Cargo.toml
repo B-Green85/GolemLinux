@@ -1,0 +1,21 @@
+[package]
+name = "gkern"
+version = "0.1.0"
+edition = "2021"
+
+# --- Dependencies ----------------------------------------------------------
+# Only one external crate is used anywhere in the tree: `spin`, pulled in by
+# the filesystem subsystem (src/fs/ramfs.rs, src/fs/vfs.rs -> `use spin::Mutex`).
+# The memory subsystem ships its own internal SpinMutex and needs nothing here.
+# `default-features = false` keeps spin no_std-clean (no std-dependent features).
+[dependencies]
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "lock_api"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

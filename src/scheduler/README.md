@@ -144,8 +144,8 @@ point and nothing references it.
 
 ### Bootstrap PCB
 
-`init()` creates a `Process::bootstrap` with `kernel_rsp = 0` and an empty
-`Box<[u8]>` stack. This represents the kernel's initial execution thread —
+`init`/`init_with` create a `Process::bootstrap` with `kernel_rsp = 0` and an
+empty `Box<[u8]>` stack. This represents the kernel's initial execution thread —
 the one that called `init()`. We never need to *resume* this PCB (it has no
 saved frame), but the first context switch off it needs somewhere to save
 state. The empty `Box<[u8]>` ensures we don't accidentally try to free the
@@ -155,8 +155,12 @@ bootloader-provided stack on drop.
 
 PID 1 is always the idle process. It is never enqueued in `ready`; it lives
 in its own slot and runs only when `ready` is empty *and* the current task
-is no longer Running. Its entry function (provided by the caller of `init`)
-is conventionally `loop { hlt }`.
+is no longer Running. Its entry function is conventionally `loop { hlt }`.
+
+The no-arg `init()` installs a built-in `idle_loop` (a `hlt`-spin) so the
+integration layer needs nothing from the power-management module to bring the
+scheduler up. A kernel that has its own idle/power-management entry can supply
+it via `init_with(owner, idle_stack, idle_entry)` instead.
 
 ### Reserved PIDs
 
@@ -177,6 +181,69 @@ side — assembly only ever sees the one pointer.
 The boot and IRQ stubs in gkern use AT&T syntax (GNU `as` default).
 Consistency beats personal preference; switching to Intel syntax later is a
 mechanical rewrite if the rest of the kernel moves first.
+
+---
+
+## Integration (Phase 2)
+
+This section records the Phase 2 work that readies the scheduler for the
+integration agent (Agent 7) to wire into `kernel_main`.
+
+### Entry point: `scheduler::init()`
+
+`kernel_main` calls `scheduler::init()` with **no arguments**. It allocates the
+idle task's kernel stack from the global heap and installs the built-in
+`idle_loop` (a `hlt`-spin) with `KERNEL_OWNER` as the placeholder accountability
+ID, then delegates to `init_with`. The full-control form `init_with(owner,
+idle_stack, idle_entry)` remains available for callers (and tests) that want to
+supply their own idle entry, stack, or owner.
+
+### Initialization order — hard dependency
+
+**Memory must be initialized before the scheduler.** `init()` allocates the
+idle stack from the `#[global_allocator]`; calling it before `memory::init` has
+registered the heap will fault. The required `kernel_main` order is:
+
+```text
+1. sentinel::init()          // governance — first
+2. memory::init(memory_map)  // registers the global allocator
+3. fs::init()
+4. scheduler::init()         // ← allocates the idle stack from the heap
+5. syscall::init()           // needs the scheduler
+```
+
+`scheduler::init()` must be called exactly once. After it returns, `spawn`,
+`yield_now`, `tick`, etc. are live; before it, they are no-ops or will observe
+an uninitialized scheduler.
+
+### `no_std` compliance
+
+Audited in Phase 2: **no `std::` path appears anywhere in `src/scheduler/`.**
+Every import resolves through `core` or `alloc` (`Box`, `String`, `Vec`,
+`VecDeque`, `UnsafeCell`, `core::arch::asm`/`global_asm`, `core::sync::atomic`).
+`mod.rs` carries `#![cfg_attr(not(test), no_std)]` to match the sibling
+subsystems' convention; the authoritative `#![no_std]` lives in the crate root
+(`src/main.rs`). The crate root is also responsible for `extern crate alloc;`
+(this module uses `Box`/`String`/`Vec`/`VecDeque`).
+
+### Context-switch ABI verification
+
+The x86_64 System V context switch in `context.rs` was reverified in Phase 2
+and is **correct**:
+
+- `context_switch` pushes all six callee-saved registers — `rbp, rbx, r12, r13,
+  r14, r15` — saves the outgoing `rsp` into `*prev_rsp_save` (`rdi`), loads the
+  incoming `rsp` (`rsi`), then pops the six registers in the exact reverse order
+  and `ret`s. Save/restore are symmetric.
+- The launch frame synthesized by `init_kernel_stack` (`process.rs`) matches the
+  pop sequence: `ret` lands in `process_entry_trampoline`, with the real entry
+  pointer pre-loaded into `r12`.
+- Stack alignment is ABI-correct: after the trampoline `ret`, `rsp ≡ 8 (mod 16)`,
+  exactly what SysV expects at a function entry reached via `call`.
+- Volatile (caller-saved) registers are intentionally *not* saved here — see
+  "Context switch saves callee-saved registers only" above.
+
+No assembly changes were required.
 
 ---
 
@@ -227,8 +294,12 @@ list:
 ```rust
 use gkern::scheduler;
 
-// Once, at boot:
-scheduler::init(kernel_owner, idle_stack, idle_entry)?;
+// Once, at boot — the integration layer (kernel_main) calls the no-arg form
+// AFTER memory::init has registered the global allocator:
+scheduler::init()?;
+
+// Or, if the kernel wants to supply its own idle entry / stack / owner:
+scheduler::init_with(kernel_owner, idle_stack, idle_entry)?;
 
 // Spawn a kernel task:
 let pid = scheduler::spawn(name, owner, entry_fn, kernel_stack);
