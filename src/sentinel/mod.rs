@@ -434,6 +434,17 @@ impl Sentinel {
 pub static SENTINEL: Sentinel = Sentinel::new();
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// Kernel version string folded into the boot audit hash. Pinned to the crate
+/// version via `CARGO_PKG_VERSION` so a version bump cannot silently desync it,
+/// and prefixed `gkern v` to match the serial banner the integration root emits
+/// on entry ("Golem Linux gkern v0.1.0", `src/main.rs`, Agent 3).
+const KERNEL_VERSION: &str = concat!("gkern v", env!("CARGO_PKG_VERSION"));
+
+/// The literal genesis-row message. This is the `action` field of the very
+/// first audit entry every Golem boot produces; a Safe-Mode audit walk keys on
+/// it to find the chain's governance genesis. Documented in README.md § 3.10.
+pub const BOOT_AUDIT_MESSAGE: &str = "SENTINEL_BOOT: kernel governance layer initialized";
+
 /// Sentinel bring-up — **the FIRST subsystem init in `kernel_main`**.
 ///
 /// This is the single entry point the integration crate root calls, and it
@@ -441,9 +452,17 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// filesystem are initialized (see the module-level "Initialization order"
 /// note). Bringing the invisibility gate up first guarantees there is no
 /// window in which a Sentinel operation could be dispatched without caller
-/// classification. It writes a `boot` entry to the audit log so every chain
-/// has a stable, identifiable genesis, then verifies the (empty) chain so a
-/// broken audit module fails fast before any traffic is accepted.
+/// classification.
+///
+/// It writes the [`BOOT_AUDIT_MESSAGE`] genesis row to the audit log so every
+/// chain has a stable, identifiable governance genesis. The row carries a
+/// SHA-256 of `"{timestamp}|{KERNEL_VERSION}"` in its `target` field (the
+/// "boot audit entry hash") — a pure function of its two inputs, hence
+/// deterministic for a given timestamp and kernel version. It then echoes the
+/// first 8 hex chars of that hash to COM1 ("Sentinel: initialized <hash>") so
+/// the serial boot log records that the governance layer came up, and verifies
+/// the chain so a broken audit module fails fast before any traffic is
+/// accepted.
 ///
 /// Idempotent: a second call is a no-op (so an accidental double-init cannot
 /// write a second genesis row). Takes no arguments and cannot fail — it does
@@ -456,12 +475,70 @@ pub fn init() {
     {
         return; // already initialized — bring-up is idempotent
     }
-    SENTINEL.audit.record(now(), "kernel", "boot", "sentinel");
-    // Verify the chain is consistent before any agent registers. This is
-    // cheap on an empty chain and forces a fast failure if the audit module
-    // is broken before we accept any traffic.
+
+    let ts = now();
+    // The boot audit entry hash: SHA-256 over the boot timestamp and the kernel
+    // version string. `sha256_hex` is a pure function, so the same (ts, version)
+    // pair always yields the same 64-char digest. We reuse the audit module's
+    // embedded SHA-256 rather than a second implementation so the boot hash and
+    // the chain hashes share one (dependency-free) primitive.
+    let boot_hash = audit::sha256_hex(alloc::format!("{ts}|{KERNEL_VERSION}").as_bytes());
+
+    // FIRST entry in the chain — the governance genesis row. The full message
+    // lives in `action`; the boot hash travels in `target` so a Safe-Mode audit
+    // walk can tie the genesis back to (timestamp, version) without re-deriving
+    // it. This replaces the old short "boot"/"sentinel" placeholder row.
+    SENTINEL.audit.record(ts, "kernel", BOOT_AUDIT_MESSAGE, &boot_hash);
+
+    // Serial confirmation for the boot log: first 8 hex chars of the boot hash.
+    // `sha256_hex` always returns 64 chars, so the slice cannot panic.
+    // SAFETY: this runs during kernel bring-up at CPL 0; `serial_write` only
+    // issues privileged port writes to the fixed COM1 register and touches no
+    // memory the caller doesn't own. See `serial_write` below.
+    unsafe {
+        serial_write(alloc::format!("Sentinel: initialized {}\n", &boot_hash[..8]).as_str());
+    }
+
+    // Verify the chain is consistent before any agent registers. This is cheap
+    // on a one-row chain and forces a fast failure if the audit module is broken
+    // before we accept any traffic.
     let _ = SENTINEL.audit.verify();
 }
+
+/// Write a string to the COM1 serial port (0x3F8), one byte at a time.
+///
+/// Mirrors the kernel's debug-output primitive in `src/main.rs` (the
+/// `serial_write` introduced by Agent 3). Sentinel keeps its own copy because
+/// the subsystem boundary forbids reaching into the crate root, and because the
+/// boot confirmation must be emitted from *inside* [`init`] — right after the
+/// genesis audit append, before any other subsystem comes up — not from the
+/// integration root after the fact.
+///
+/// SAFETY: callers must guarantee CPL 0 (the `out` instruction is privileged).
+/// The function reads no memory the caller doesn't own (`s` is a normal `&str`)
+/// and writes only to the I/O port, so it is sound for any well-formed string
+/// at ring 0.
+#[cfg(all(target_arch = "x86_64", not(test)))]
+unsafe fn serial_write(s: &str) {
+    for byte in s.bytes() {
+        // SAFETY: `out dx, al` writes one byte to the COM1 data register. It is
+        // privileged but legal at CPL 0; it touches no memory and preserves
+        // flags, hence the options below.
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") 0x3F8u16,
+            in("al") byte,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// Host/test stand-in. Under `cargo test` (host `std`, possibly a non-x86_64
+/// host) there is no COM1 port and the `out` instruction would not assemble, so
+/// the serial echo is a no-op. The audit append — the load-bearing record — is
+/// unaffected; only the cosmetic boot-log line is skipped.
+#[cfg(not(all(target_arch = "x86_64", not(test))))]
+unsafe fn serial_write(_s: &str) {}
 
 pub fn is_initialized() -> bool {
     INITIALIZED.load(Ordering::Acquire)
@@ -616,6 +693,36 @@ mod tests {
         // are registered.
         let err = s.status(CallerContext::Agent, "anything").unwrap_err();
         assert_eq!(err.to_errno(), 38); // ENOSYS, not ENOENT
+    }
+
+    #[test]
+    fn boot_writes_sentinel_boot_as_first_audit_entry() {
+        // `init()` drives the global singleton and is idempotent; this is the
+        // only test that calls it, so the global chain's genesis row is ours
+        // regardless of test ordering (every other test uses `fresh()`).
+        init();
+        let entries = SENTINEL.audit_internal().snapshot();
+        assert!(!entries.is_empty(), "boot must write a genesis row");
+
+        let genesis = &entries[0];
+        assert_eq!(genesis.sequence, 1, "boot row must be FIRST in the chain");
+        assert_eq!(genesis.action, BOOT_AUDIT_MESSAGE);
+        assert_eq!(genesis.actor, "kernel");
+
+        // The boot audit entry hash is SHA-256(timestamp | kernel version) and
+        // is deterministic for the recorded timestamp — recompute and compare.
+        let expected =
+            audit::sha256_hex(alloc::format!("{}|{}", genesis.timestamp, KERNEL_VERSION).as_bytes());
+        assert_eq!(genesis.target, expected, "boot hash must be deterministic");
+        assert_eq!(expected.len(), 64, "SHA-256 hex is always 64 chars");
+
+        // The serial confirmation uses the first 8 hex chars of that hash.
+        let _serial_hash = &expected[..8];
+
+        // A second init() must NOT append a second genesis row.
+        init();
+        let again = SENTINEL.audit_internal().snapshot();
+        assert_eq!(again.len(), entries.len(), "double-init must be a no-op");
     }
 
     #[test]

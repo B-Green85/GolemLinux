@@ -192,9 +192,32 @@ Configuration changes are themselves audit events. They appear in the chain with
 
 ### 3.10 The Singleton + `init`
 
-`SENTINEL` is the single instance of `Sentinel` per kernel. It is `const`-constructible (no allocations at construction time) so it can live in a `static`. `init()` is idempotent and writes a `boot` entry to the audit chain so every chain has a stable, identifiable genesis. The boot entry also lets a Safe-Mode chain-export tool detect "this is the same kernel session" vs "the kernel rebooted".
+`SENTINEL` is the single instance of `Sentinel` per kernel. It is `const`-constructible (no allocations at construction time) so it can live in a `static`. `init()` is idempotent and writes the boot audit entry (below) to the audit chain so every chain has a stable, identifiable governance genesis. The boot entry also lets a Safe-Mode chain-export tool detect "this is the same kernel session" vs "the kernel rebooted".
 
 The `INITIALIZED` flag prevents double-init from accidentally writing a second genesis row.
+
+#### The boot audit entry (`SENTINEL_BOOT`)
+
+The **first** row in every boot's audit chain is the governance-genesis entry written by `init()`. It is the proof, recorded in the tamper-evident log itself, that the kernel governance layer came up before anything else did.
+
+| Field       | Value                                                            |
+| ----------- | --------------------------------------------------------------- |
+| `sequence`  | `1` (always first — `init()` is step 1 of `kernel_main`)        |
+| `actor`     | `"kernel"`                                                      |
+| `action`    | `"SENTINEL_BOOT: kernel governance layer initialized"` (`BOOT_AUDIT_MESSAGE`) |
+| `target`    | the **boot audit entry hash** (see below)                       |
+| `timestamp` | the boot tick from `now()`                                       |
+| `hash` / `prev_hash` | the usual chain hash; `prev_hash` is the all-zero genesis sentinel |
+
+**Boot audit entry hash.** A SHA-256 of `"{timestamp}|{KERNEL_VERSION}"`, where `KERNEL_VERSION` is `concat!("gkern v", env!("CARGO_PKG_VERSION"))` (e.g. `gkern v0.1.0`, matching the serial banner the integration root emits on entry). It is computed with the audit module's embedded `sha256_hex` — no second crypto implementation — and carried in the entry's `target` field so a Safe-Mode audit walk can recover `(timestamp, version)` without re-deriving it. The hash is a **pure function of its two inputs**: the same `(timestamp, kernel version)` pair always produces the same 64-char digest (`audit.rs` § 3.4 covers why determinism here matters — `verify()` recomputes it).
+
+**Serial confirmation.** Immediately after appending the genesis row, `init()` echoes to COM1 (`0x3F8`):
+
+```
+Sentinel: initialized <hash>\n
+```
+
+where `<hash>` is the first 8 hex chars of the boot audit entry hash. This uses the same `serial_write` port-write primitive as the integration root's boot banner (`src/main.rs`, Agent 3); Sentinel keeps its own copy because the subsystem boundary forbids reaching into the crate root and the confirmation must be emitted from *inside* `init()` — between the audit append and the next subsystem's bring-up. On non-x86_64 / `cargo test` builds the port write is a no-op (there is no COM1); the audit append, which is the load-bearing record, is unaffected.
 
 ### 3.11 Time
 
@@ -293,7 +316,7 @@ Every module ships with `#[cfg(test)]` units. Coverage summary:
 - **`invisible.rs`**: Agent ENOSYS; Agent handshake permitted; Operator config denied outside Safe Mode; Safe Mode config permitted; ENOSYS errno locked at 38.
 - **`handshake.rs`**: First-registration success; re-registration rejected; empty ID rejected; oversized ID rejected; heartbeat bounds; heartbeat updates record; lock semantics; token truncation.
 - **`monitor.rs`**: Fresh agent → None; repetition crosses Soft; forget clears state; tool retry detection; normalize collapses whitespace/case; tier threshold edges; combine gates correctly; injected signal drives tier.
-- **`mod.rs`** (facade integration): Agent handshakes and gets token; Agent denied status; Operator gets status; probes audited silently; Hard tier locks agent; Safe Mode configures; chain verifies after traffic; deregister clears monitor state; unknown agent ENOENT to Operator but ENOSYS to Agent; injected signal drives facade tier.
+- **`mod.rs`** (facade integration): Agent handshakes and gets token; Agent denied status; Operator gets status; probes audited silently; Hard tier locks agent; Safe Mode configures; chain verifies after traffic; deregister clears monitor state; unknown agent ENOENT to Operator but ENOSYS to Agent; injected signal drives facade tier; **boot writes `SENTINEL_BOOT` as the first chain entry with a deterministic SHA-256(timestamp | kernel version) hash, and a second `init()` is a no-op** (`boot_writes_sentinel_boot_as_first_audit_entry`, see § 3.10).
 
 **How the units are verified.** The integration crate root (`src/main.rs`) is a `#![no_std] #![no_main]` *binary* with no lib target, so `cargo test -p gkern --lib sentinel` does not apply to the assembled kernel (it reports "no library targets found"). The `#[cfg(test)]` units above are retained as the authoritative behavioral spec and are written to run unmodified under a host `std` harness if the subsystem is ever split into a testable lib (this is what the `#![cfg_attr(not(test), no_std)]` gate in § 3.2 enables). In Phase 2, correctness is established by:
 
