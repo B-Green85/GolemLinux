@@ -6,7 +6,7 @@
 ; Format:    PE32+ UEFI application
 ; Assembler: NASM 2.15+ (Intel syntax)
 ;
-; Copyright (c) 2026 TrueSystems LLC. All rights reserved.
+; Copyright (c) 2026 Brandon Green. Licensed under the Apache 2.0 License.
 ;
 ; ----------------------------------------------------------------------------
 ; Purpose

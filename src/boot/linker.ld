@@ -9,7 +9,7 @@
  *
  *     ld --script src/boot/linker.ld -o build/gkern.elf <objects>
  *
- * Copyright (c) 2026 TrueSystems LLC. All rights reserved.
+ * Copyright (c) 2026 Brandon Green. Licensed under the Apache 2.0 License.
  *
  * ----------------------------------------------------------------------------
  * The Golem bootloader (a PE32+ UEFI application whose entry stub lives in
