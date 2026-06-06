@@ -29,6 +29,7 @@ mod memory;
 mod scheduler;
 mod sentinel;
 mod syscall;
+mod safemode; 
 
 /// Kernel entry point.
 ///
@@ -76,14 +77,29 @@ pub extern "C" fn kernel_main(memory_map: *const ()) -> ! {
         serial_write("  memory: initialized\n");
     }
 
-    // 3. FILESYSTEM. Needs the heap. init() mounts ramfs at "/".
+    // 3. MIGRATION. Apply any Sentinel config changes written in Safe Mode.
+    //    Must run after memory (allocates for SHA-256 + audit append).
+    //    Failure halts — an unresolved Sentinel state is not recoverable.
+    if let Err(e) = sentinel::migration::run() {
+        unsafe {
+            serial_write("  migration: FAILED — ");
+            serial_write(e.reason());
+            serial_write("\n");
+        }
+        halt();
+    }
+    unsafe {
+        serial_write("  migration: ok\n");
+    }
+
+    // 4. FILESYSTEM. Needs the heap. init() mounts ramfs at "/".
     fs::init();
     // SAFETY: see banner — CPL 0, fixed COM1 port, port-write-only helper.
     unsafe {
         serial_write("  fs: initialized\n");
     }
 
-    // 4. SCHEDULER. Needs the heap.
+    // 5. SCHEDULER. Needs the heap.
     if scheduler::init().is_err() {
         // SAFETY: see banner — CPL 0, fixed COM1 port, port-write-only helper.
         unsafe {
@@ -96,7 +112,7 @@ pub extern "C" fn kernel_main(memory_map: *const ()) -> ! {
         serial_write("  scheduler: initialized\n");
     }
 
-    // 5. SYSCALL. Needs the scheduler. init() writes the LSTAR MSR.
+    // 6. SYSCALL. Needs the scheduler. init() writes the LSTAR MSR.
     // SAFETY: CPL 0, long mode active, scheduler initialized — the documented
     // preconditions for the LSTAR MSR write are satisfied.
     unsafe {
