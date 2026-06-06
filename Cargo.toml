@@ -11,6 +11,26 @@ edition = "2021"
 [dependencies]
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "lock_api"] }
 
+# --- Features ---------------------------------------------------------------
+# `sentinel-safemode` is the COMPILE-TIME selector for the Safe Mode recovery
+# kernel. It carries no dependencies and no code of its own — it is a pure
+# build-level flag that flips `sentinel::invisible::SAFE_MODE_ACTIVE` from
+# `false` (main OS, `gkern`) to `true` (`gkern-safemode`). With the flag set,
+# Sentinel's configuration interface (ReadAudit + Configure) is reachable from
+# the agent-free Safe Mode serial terminal; without it, that interface is not
+# compiled into the binary at all and every config query is denied.
+#
+# This is a property of the BINARY's feature set, not a runtime variable: no
+# userspace process, Agent, or Operator can enable it. Build the two kernels as:
+#
+#   cargo build --bin gkern                                    # main OS, invisible
+#   cargo build --features sentinel-safemode --bin gkern-safemode   # Safe Mode
+#
+# Mirrors the sentinel-enforcer / sentinel-observer compile-time split: the
+# capability is absent from the wrong build, not merely refused at runtime.
+[features]
+sentinel-safemode = []
+
 [profile.release]
 opt-level = 3
 lto = true
