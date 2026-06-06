@@ -34,6 +34,13 @@
 use core::ptr;
 use core::sync::atomic::{compiler_fence, Ordering};
 
+/// Agent 2's fixed-address migration-buffer model (`MigrationBuffer`, magic,
+/// version, seal/checksum). The boot-time migration daemon reads it through
+/// `crate::safemode::sentinel_config`, so the path must be reachable from the
+/// kernel crate root. `pub` so `sentinel::migration` (a sibling subsystem) can
+/// resolve it.
+pub mod sentinel_config;
+
 // ===========================================================================
 // Serial — 16550 UART on COM1, full duplex (transmit *and* receive)
 // ===========================================================================

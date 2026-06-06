@@ -3,6 +3,10 @@ name = "gkern"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "gkern-safemode"
+path = "src/safemode/main.rs"
+
 # --- Dependencies ----------------------------------------------------------
 # Only one external crate is used anywhere in the tree: `spin`, pulled in by
 # the filesystem subsystem (src/fs/ramfs.rs, src/fs/vfs.rs -> `use spin::Mutex`).
