@@ -6,14 +6,29 @@ edition = "2021"
 [[bin]]
 name = "gkern-safemode"
 path = "src/safemode/main.rs"
+# Safe Mode is its own compile-time posture (see `sentinel-safemode` below). This
+# binary is only meaningful — and is only built — when that feature is selected:
+#
+#   cargo build --features sentinel-safemode --bin gkern-safemode
+#
+# Gating it here keeps the main-kernel builds (`--features sentinel-enforcer` /
+# `sentinel-observer`) from also trying to compile the Safe Mode binary, which
+# pulls in an unrelated module surface and has nothing to do with the enforcer/
+# observer posture split.
+required-features = ["sentinel-safemode"]
 
 # --- Dependencies ----------------------------------------------------------
 # Only one external crate is used anywhere in the tree: `spin`, pulled in by
 # the filesystem subsystem (src/fs/ramfs.rs, src/fs/vfs.rs -> `use spin::Mutex`).
 # The memory subsystem ships its own internal SpinMutex and needs nothing here.
 # `default-features = false` keeps spin no_std-clean (no std-dependent features).
+# Only `spin::Mutex` is used anywhere (src/fs/vfs.rs, src/fs/ramfs.rs), which the
+# `spin_mutex` feature provides (it transitively enables `mutex`). We deliberately
+# do NOT enable spin's `lock_api` feature: it pulls in the `lock_api` crate, which
+# depends on `scopeguard`, which is not no_std-compatible and breaks the
+# x86_64-unknown-none build. No code uses the lock_api-based wrappers.
 [dependencies]
-spin = { version = "0.9", default-features = false, features = ["spin_mutex", "lock_api"] }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 
 # --- Features ---------------------------------------------------------------
 # `sentinel-safemode` is the COMPILE-TIME selector for the Safe Mode recovery
@@ -34,6 +49,22 @@ spin = { version = "0.9", default-features = false, features = ["spin_mutex", "l
 # capability is absent from the wrong build, not merely refused at runtime.
 [features]
 sentinel-safemode = []
+
+# --- v3 capability split (Agent 7) ------------------------------------------
+# Exactly one of these MUST be selected for the main kernel (`gkern`) to
+# compile. They are mutually exclusive, enforced at compile time in
+# `src/sentinel/mod.rs` (both -> compile_error!, neither -> compile_error!).
+# The capability is a property of the binary's feature set: the Enforcer's
+# machinery is not compiled into an observer build, and vice versa.
+#
+#   cargo build --features sentinel-enforcer --bin gkern   # active enforcement
+#   cargo build --features sentinel-observer --bin gkern   # watch-only, logs
+#
+# This changes the canonical main-OS build invocation: a feature-free
+# `cargo build` is now a deliberate compile error (a Sentinel kernel with no
+# declared posture is not a valid build).
+sentinel-enforcer = []
+sentinel-observer = []
 
 [profile.release]
 opt-level = 3
