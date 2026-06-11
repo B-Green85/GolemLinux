@@ -24,6 +24,7 @@ extern crate alloc;
 // --- Subsystem modules -----------------------------------------------------
 // `boot` is assembly + linker script only (no mod.rs) and is linked via
 // src/boot/boot.asm + src/boot/linker.ld, so it is not declared as a module.
+mod drivers;
 mod fs;
 mod memory;
 mod scheduler;
@@ -99,7 +100,14 @@ pub extern "C" fn kernel_main(memory_map: *const ()) -> ! {
         serial_write("  fs: initialized\n");
     }
 
-    // 5. SCHEDULER. Needs the heap.
+    // 5. DRIVERS. Hardware detection (CPUID). Read-only and needs nothing from
+    //    earlier subsystems, but is sequenced after memory init so its serial
+    //    output lands in the expected place in the boot log, and before the
+    //    scheduler starts. The detected CpuInfo is logged internally; the boot
+    //    path does not gate on it, so the return value is discarded.
+    let _ = drivers::init();
+
+    // 6. SCHEDULER. Needs the heap.
     if scheduler::init().is_err() {
         // SAFETY: see banner — CPL 0, fixed COM1 port, port-write-only helper.
         unsafe {
@@ -112,7 +120,7 @@ pub extern "C" fn kernel_main(memory_map: *const ()) -> ! {
         serial_write("  scheduler: initialized\n");
     }
 
-    // 6. SYSCALL. Needs the scheduler. init() writes the LSTAR MSR.
+    // 7. SYSCALL. Needs the scheduler. init() writes the LSTAR MSR.
     // SAFETY: CPL 0, long mode active, scheduler initialized — the documented
     // preconditions for the LSTAR MSR write are satisfied.
     unsafe {
